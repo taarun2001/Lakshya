@@ -9,7 +9,11 @@ dns.setDefaultResultOrder('ipv4first');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// API configuration — supports both Gemini and NVIDIA
+// API configuration — supports Groq, Gemini, and NVIDIA
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
+const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
@@ -17,19 +21,34 @@ const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || process.env['NVIDIABuild-Au
 const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 const DEFAULT_NVIDIA_MODEL = process.env.NVIDIA_MODEL || 'meta/llama-3.2-11b-vision-instruct';
 
+function getActiveProvider() {
+  if (GROQ_API_KEY) return 'groq';
+  if (GEMINI_API_KEY) return 'gemini';
+  if (NVIDIA_API_KEY) return 'nvidia';
+  return 'none';
+}
+
+function getActiveModel() {
+  const provider = getActiveProvider();
+  if (provider === 'groq') return GROQ_MODEL;
+  if (provider === 'gemini') return GEMINI_MODEL;
+  if (provider === 'nvidia') return DEFAULT_NVIDIA_MODEL;
+  return 'none';
+}
+
 app.use(cors({ origin: 'http://localhost:5173' }));
 app.use(express.json({ limit: '1mb' }));
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
-  const provider = GEMINI_API_KEY ? 'gemini' : (NVIDIA_API_KEY ? 'nvidia' : 'none');
-  const activeModel = GEMINI_API_KEY ? GEMINI_MODEL : DEFAULT_NVIDIA_MODEL;
+  const provider = getActiveProvider();
+  const activeModel = getActiveModel();
 
   res.json({
     status: 'ok',
     provider,
     model: activeModel,
-    keyConfigured: !!(GEMINI_API_KEY || NVIDIA_API_KEY),
+    keyConfigured: provider !== 'none',
   });
 });
 
@@ -56,11 +75,23 @@ async function callGeminiAPI(messages, systemPrompt, maxTokens = 1500) {
     };
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('AI_TIMEOUT');
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -98,14 +129,26 @@ async function callNvidiaAPI(messages, systemPrompt, maxTokens = 1024) {
     stream: false,
   };
 
-  const response = await fetch(`${NVIDIA_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${NVIDIA_API_KEY}`,
-    },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+  let response;
+  try {
+    response = await fetch(`${NVIDIA_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${NVIDIA_API_KEY}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('AI_TIMEOUT');
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     const status = response.status;
@@ -119,15 +162,78 @@ async function callNvidiaAPI(messages, systemPrompt, maxTokens = 1024) {
   return data.choices?.[0]?.message?.content ?? '';
 }
 
+// ── Shared: call Groq API ─────────────────────────────────────
+async function callGroqAPI(messages, systemPrompt, maxTokens = 1500) {
+  if (!GROQ_API_KEY) {
+    throw new Error('Groq API key is not configured on the server.');
+  }
+
+  const formattedMessages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    ...messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    })),
+  ];
+
+  const payload = {
+    model: GROQ_MODEL,
+    messages: formattedMessages,
+    temperature: 0.6,
+    max_tokens: maxTokens,
+  };
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+  let response;
+  try {
+    response = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${GROQ_API_KEY.trim()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('AI_TIMEOUT');
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const status = response.status;
+    if (status === 401 || status === 403) throw new Error(`API_AUTH_ERROR: ${errorText}`);
+    if (status === 429) throw new Error('API_RATE_LIMIT');
+    if (status === 400) throw new Error(`API_BAD_REQUEST: ${errorText}`);
+    throw new Error(`GROQ_ERROR_${status}: ${errorText}`);
+  }
+
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error('Groq returned an empty response.');
+  }
+  return text;
+}
+
 // ── Unified AI Dispatcher ─────────────────────────────────────
 async function callAI(messages, systemPrompt, maxTokens = 1500) {
-  if (GEMINI_API_KEY) {
+  const provider = getActiveProvider();
+  if (provider === 'groq') {
+    return await callGroqAPI(messages, systemPrompt, maxTokens);
+  }
+  if (provider === 'gemini') {
     return await callGeminiAPI(messages, systemPrompt, maxTokens);
   }
-  if (NVIDIA_API_KEY) {
+  if (provider === 'nvidia') {
     return await callNvidiaAPI(messages, systemPrompt, maxTokens);
   }
-  throw new Error('API key is not configured on the server. Please add GEMINI_API_KEY or NVIDIA_API_KEY to your .env file.');
+  throw new Error('API key is not configured on the server. Please add GROQ_API_KEY, GEMINI_API_KEY, or NVIDIA_API_KEY to your .env file.');
 }
 
 // ── Route: General AI Chat ────────────────────────────────────
@@ -298,22 +404,28 @@ function handleError(err, res) {
   console.error('[Laksha API Error]', err.message);
 
   const message = err.message || '';
+  const providerKey = getActiveProvider();
+  const provider = providerKey === 'groq' ? 'Groq' : (providerKey === 'gemini' ? 'Gemini' : 'NVIDIA');
+
+  if (message.includes('AI_TIMEOUT')) {
+    return res.status(504).json({ error: 'The AI took too long to respond (30s timeout). Please try again.' });
+  }
   if (message.includes('API_AUTH_ERROR') || message.includes('401')) {
     return res.status(502).json({
-      error: 'NVIDIA AI authentication failed. Please verify your API key in .env (keys from build.nvidia.com begin with "nvapi-").',
+      error: `${provider} AI authentication failed. Please verify your API key in .env.`,
     });
   }
   if (message.includes('API_RATE_LIMIT') || message.includes('429')) {
-    return res.status(429).json({ error: 'NVIDIA AI rate limit reached. Please wait a moment and try again.' });
+    return res.status(429).json({ error: `${provider} AI rate limit reached. Please wait a moment and try again.` });
   }
   if (message.includes('API_BAD_REQUEST') || message.includes('400')) {
-    return res.status(400).json({ error: 'Invalid request to NVIDIA AI. Please try again.' });
+    return res.status(400).json({ error: `Invalid request to ${provider} AI. Please try again.` });
   }
   if (message.includes('API key is not configured')) {
-    return res.status(503).json({ error: 'NVIDIA API key is not configured in .env.' });
+    return res.status(503).json({ error: 'AI API key is not configured in .env (add GROQ_API_KEY, GEMINI_API_KEY, or NVIDIA_API_KEY).' });
   }
   if (message.includes('ENOTFOUND') || message.includes('fetch failed')) {
-    return res.status(503).json({ error: 'Unable to reach AI services. Please check network connection.' });
+    return res.status(503).json({ error: 'Unable to reach AI services. Please check your network connection.' });
   }
 
   return res.status(500).json({ error: `AI error: ${message || 'An unexpected error occurred.'}` });
@@ -321,12 +433,15 @@ function handleError(err, res) {
 
 // ── Start Server ──────────────────────────────────────────────
 app.listen(PORT, () => {
-  if (GEMINI_API_KEY) {
+  const provider = getActiveProvider();
+  if (provider === 'groq') {
+    console.log(`[Laksha API] ✓ Groq API key loaded (${GROQ_MODEL})`);
+  } else if (provider === 'gemini') {
     console.log(`[Laksha API] ✓ Google Gemini API key loaded (${GEMINI_MODEL})`);
-  } else if (NVIDIA_API_KEY) {
+  } else if (provider === 'nvidia') {
     console.log(`[Laksha API] ✓ NVIDIA API key loaded (${DEFAULT_NVIDIA_MODEL})`);
   } else {
-    console.warn('[Laksha API] ⚠️  WARNING: No AI API key found in .env (set GEMINI_API_KEY or NVIDIA_API_KEY)');
+    console.warn('[Laksha API] ⚠️  WARNING: No AI API key found in .env (set GROQ_API_KEY, GEMINI_API_KEY, or NVIDIA_API_KEY)');
   }
   console.log(`[Laksha API] ✓ Server running on http://localhost:${PORT}`);
 });

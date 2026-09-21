@@ -74,11 +74,11 @@ export const aiService = {
   /**
    * Check if the backend is reachable and API key is configured.
    */
-  async healthCheck(): Promise<{ ok: boolean; keyConfigured: boolean }> {
+  async healthCheck(): Promise<{ ok: boolean; keyConfigured: boolean; provider?: string; model?: string }> {
     try {
       const response = await fetch(`${API_BASE}/health`);
       const data = await response.json();
-      return { ok: true, keyConfigured: !!data.keyConfigured };
+      return { ok: true, keyConfigured: !!data.keyConfigured, provider: data.provider, model: data.model };
     } catch {
       return { ok: false, keyConfigured: false };
     }

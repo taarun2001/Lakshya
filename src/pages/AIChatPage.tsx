@@ -39,6 +39,7 @@ export const AIChatPage: React.FC = () => {
   const [appSummary, setAppSummary] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const lastUserMessageRef = useRef<string>('');
 
   // Build app context once on mount
   useEffect(() => {
@@ -64,6 +65,7 @@ export const AIChatPage: React.FC = () => {
     const trimmed = text.trim();
     if (!trimmed || isLoading) return;
 
+    lastUserMessageRef.current = trimmed;
     const userMsg: ChatMessage = { role: 'user', content: trimmed };
     const updatedMessages = [...messages, userMsg];
 
@@ -93,6 +95,17 @@ export const AIChatPage: React.FC = () => {
       setIsLoading(false);
     }
   }, [messages, isLoading, appSummary]);
+
+  const handleRetry = useCallback(() => {
+    if (!lastUserMessageRef.current) return;
+    // Remove the last user message from history so it's not duplicated
+    const withoutLast = messages.at(-1)?.role === 'user'
+      ? messages.slice(0, -1)
+      : messages;
+    setMessages(withoutLast);
+    setError(null);
+    sendMessage(lastUserMessageRef.current);
+  }, [messages, sendMessage]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -214,13 +227,24 @@ export const AIChatPage: React.FC = () => {
         {error && (
           <div className="flex items-start gap-2 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 mx-1">
             <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-            <div>
+            <div className="flex-1 min-w-0">
               <span className="font-semibold block">Error</span>
               <span>{error}</span>
             </div>
-            <button onClick={() => setError(null)} className="ml-auto shrink-0 text-rose-500 hover:text-rose-700">
-              <X className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {lastUserMessageRef.current && (
+                <button
+                  onClick={handleRetry}
+                  className="flex items-center gap-1 px-2 py-1 rounded-md bg-rose-100 hover:bg-rose-200 text-rose-700 font-medium transition-colors"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Retry
+                </button>
+              )}
+              <button onClick={() => setError(null)} className="text-rose-500 hover:text-rose-700">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         )}
 
