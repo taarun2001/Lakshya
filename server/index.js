@@ -431,6 +431,11 @@ function handleError(err, res) {
   return res.status(500).json({ error: `AI error: ${message || 'An unexpected error occurred.'}` });
 }
 
+// ── 404 Fallback for API Routes ───────────────────────────────
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API route not found' });
+});
+
 // ── Start Server ──────────────────────────────────────────────
 app.listen(PORT, () => {
   const provider = getActiveProvider();
